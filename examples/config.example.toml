@@ -52,6 +52,19 @@ timeout = 60
 # Default: 5
 # health_check_interval = 5
 
+# Streaming Mode Configuration
+# Whether to use streaming (SSE) or non-streaming mode for requests
+# Streaming mode (true):
+#   - Measures TTFT (time to first token), ITL (inter-token latency), TPOT
+#   - Higher memory usage (~1MB per concurrent request for token buffers)
+#   - Required for detailed per-token metrics
+# Non-streaming mode (false):
+#   - Lower memory usage (no token buffers)
+#   - Only measures total request latency and throughput
+#   - Use when you don't need per-token timing metrics
+# Default: true
+# use_streaming = true
+
 # =============================================================================
 # Load Configuration
 # =============================================================================

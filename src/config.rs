@@ -40,6 +40,8 @@ pub struct EndpointConfig {
     pub health_check_timeout: u64, // Total time to wait for server readiness in seconds (0 = disabled)
     #[serde(default = "default_health_check_interval")]
     pub health_check_interval: u64, // Interval between readiness check retries in seconds
+    #[serde(default = "default_use_streaming")]
+    pub use_streaming: bool, // Whether to use streaming mode (SSE) or non-streaming mode
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -305,6 +307,10 @@ fn default_health_check_timeout() -> u64 {
 
 fn default_health_check_interval() -> u64 {
     5 // 5 seconds
+}
+
+fn default_use_streaming() -> bool {
+    true // Streaming enabled by default
 }
 
 fn default_concurrent_requests() -> usize {

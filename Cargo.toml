@@ -41,6 +41,7 @@ tokio = { version = "1.35", features = ["full"] }
 tokio-stream = "0.1"
 toml = "0.8"
 warp = "0.3"
+sysinfo = "0.32"
 
 [dev-dependencies]
 mockito = "1.2"

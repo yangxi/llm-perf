@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use sysinfo::{System, RefreshKind, ProcessRefreshKind, ProcessesToUpdate};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Semaphore;
@@ -83,6 +84,21 @@ pub enum Workload {
     MultiTurn(Conversation),
 }
 
+/// Helper function to get current process RSS memory in MB
+fn get_rss_mb() -> f64 {
+    let mut sys = System::new_with_specifics(
+        RefreshKind::new().with_processes(ProcessRefreshKind::new().with_memory()),
+    );
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+
+    let pid = sysinfo::get_current_pid().unwrap();
+    if let Some(process) = sys.process(pid) {
+        process.memory() as f64 / 1024.0 / 1024.0
+    } else {
+        0.0
+    }
+}
+
 /// Core benchmarking engine for testing OpenAI-compatible LLM servers.
 ///
 /// The BenchmarkRunner orchestrates the entire benchmarking process including:
@@ -148,6 +164,10 @@ impl BenchmarkRunner {
         // Initialize metrics
         Metrics::init();
 
+        // Track memory at start
+        let mem_start = get_rss_mb();
+        info!("RSS memory at start: {:.1} MB", mem_start);
+
         // Wait for server to be ready if timeout is set (> 0)
         // This is optional and useful when starting servers that need time to load models
         if config.endpoint.health_check_timeout > 0 {
@@ -176,6 +196,10 @@ impl BenchmarkRunner {
             detected
         };
 
+        // Track memory before creating client
+        let mem_before_client = get_rss_mb();
+        info!("RSS memory before creating HTTP client: {:.1} MB", mem_before_client);
+
         // Create OpenAI client with retry configuration and connection pool size
         let client = OpenAIClient::new(crate::client::ClientConfig {
             base_url: config.endpoint.base_url.clone(),
@@ -187,6 +211,15 @@ impl BenchmarkRunner {
             retry_max_delay_ms: config.endpoint.retry_max_delay_ms,
             pool_size: config.load.concurrent_requests, // Pool size matches concurrency
         })?;
+
+        // Track memory after creating client (connection pool created)
+        let mem_after_client = get_rss_mb();
+        info!(
+            "RSS memory after creating HTTP client (pool_size={}): {:.1} MB (+{:.1} MB)",
+            config.load.concurrent_requests,
+            mem_after_client,
+            mem_after_client - mem_before_client
+        );
 
         // Create tokenizer
         let tokenizer = Tokenizer::new(&model)?;
@@ -224,6 +257,18 @@ impl BenchmarkRunner {
         } else {
             info!("Loaded {} prompts", workloads.len());
         }
+
+        // Track memory after loading workloads
+        let mem_after_workloads = get_rss_mb();
+        info!(
+            "RSS memory after loading workloads: {:.1} MB (+{:.1} MB)",
+            mem_after_workloads,
+            mem_after_workloads - mem_after_client
+        );
+        info!(
+            "Total memory growth from start: {:.1} MB",
+            mem_after_workloads - mem_start
+        );
 
         Ok(Self {
             client: Arc::new(client),
@@ -338,6 +383,10 @@ impl BenchmarkRunner {
 
         debug!("Starting benchmark run");
 
+        // Track memory before benchmark starts
+        let mem_before_run = get_rss_mb();
+        info!("RSS memory before starting benchmark: {:.1} MB", mem_before_run);
+
         // Set running flag
         crate::metrics::RUNNING.store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -386,6 +435,14 @@ impl BenchmarkRunner {
                 .await?;
             (d, None)
         };
+
+        // Track memory after benchmark completes
+        let mem_after_run = get_rss_mb();
+        info!(
+            "RSS memory after benchmark: {:.1} MB (+{:.1} MB from start)",
+            mem_after_run,
+            mem_after_run - mem_before_run
+        );
 
         // Stop metrics capture
         crate::metrics::RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -469,6 +526,7 @@ impl BenchmarkRunner {
 
                 // Capture system_prompt for this closure
                 let system_prompt = self.config.input.system_prompt.clone();
+                let use_streaming = self.config.endpoint.use_streaming;
 
                 let handle = tokio::spawn(async move {
                     let _permit = semaphore
@@ -482,6 +540,7 @@ impl BenchmarkRunner {
                         workload,
                         idx,
                         true,
+                        use_streaming,
                     )
                     .await;
                     warmup_completed.fetch_add(1, Ordering::Relaxed);
@@ -513,6 +572,7 @@ impl BenchmarkRunner {
 
                 // Capture system_prompt for this closure
                 let system_prompt = self.config.input.system_prompt.clone();
+                let use_streaming = self.config.endpoint.use_streaming;
 
                 let handle = tokio::spawn(async move {
                     let _permit = semaphore
@@ -526,6 +586,7 @@ impl BenchmarkRunner {
                         workload,
                         idx,
                         false,
+                        use_streaming,
                     )
                     .await;
                     completed.fetch_add(1, Ordering::Relaxed);
@@ -541,6 +602,19 @@ impl BenchmarkRunner {
                 info!("Starting warmup phase for {} seconds", warmup_dur.as_secs());
                 let warmup_deadline = Instant::now() + warmup_dur;
 
+                // Spawn periodic memory monitor for warmup
+                let warmup_mem_monitor = {
+                    let warmup_deadline_clone = warmup_deadline;
+                    tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(Duration::from_secs(30));
+                        while Instant::now() < warmup_deadline_clone {
+                            interval.tick().await;
+                            let mem = get_rss_mb();
+                            info!("🔥 Warmup memory check: {:.1} MB RSS", mem);
+                        }
+                    })
+                };
+
                 // Spawn warmup workers
                 let mut warmup_handles = Vec::new();
                 for _worker_id in 0..self.config.load.concurrent_requests {
@@ -553,6 +627,7 @@ impl BenchmarkRunner {
 
                     // Capture system_prompt for this closure
                     let system_prompt = self.config.input.system_prompt.clone();
+                    let use_streaming = self.config.endpoint.use_streaming;
 
                     let handle = tokio::spawn(async move {
                         while Instant::now() < warmup_deadline {
@@ -571,6 +646,7 @@ impl BenchmarkRunner {
                                 workload,
                                 idx,
                                 true,
+                                use_streaming,
                             )
                             .await;
                             warmup_completed.fetch_add(1, Ordering::Relaxed);
@@ -597,6 +673,19 @@ impl BenchmarkRunner {
             let deadline = test_start + duration;
             info!("Running main test for {} seconds", duration.as_secs());
 
+            // Spawn periodic memory monitor
+            let mem_monitor_handle = {
+                let should_stop = Arc::clone(&should_stop);
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(30));
+                    while !should_stop.load(Ordering::Relaxed) {
+                        interval.tick().await;
+                        let mem = get_rss_mb();
+                        info!("📊 Periodic memory check: {:.1} MB RSS", mem);
+                    }
+                })
+            };
+
             // Spawn worker tasks
             for _worker_id in 0..self.config.load.concurrent_requests {
                 let client = Arc::clone(&self.client);
@@ -609,6 +698,7 @@ impl BenchmarkRunner {
 
                 // Capture system_prompt for this closure
                 let system_prompt = self.config.input.system_prompt.clone();
+                let use_streaming = self.config.endpoint.use_streaming;
 
                 let handle = tokio::spawn(async move {
                     while !should_stop.load(Ordering::Relaxed) {
@@ -646,6 +736,7 @@ impl BenchmarkRunner {
                             workload,
                             idx,
                             false,
+                            use_streaming,
                         );
                         match tokio::time::timeout(remaining, request_future).await {
                             Ok(_) => {
@@ -738,6 +829,7 @@ impl BenchmarkRunner {
 
                 // Capture system_prompt for this closure
                 let system_prompt = self.config.input.system_prompt.clone();
+                let use_streaming = self.config.endpoint.use_streaming;
 
                 let handle = tokio::spawn(async move {
                     while Instant::now() < warmup_deadline {
@@ -754,6 +846,7 @@ impl BenchmarkRunner {
                             workload,
                             idx,
                             true,
+                            use_streaming,
                         )
                         .await;
                     }
@@ -792,6 +885,7 @@ impl BenchmarkRunner {
             let workloads = self.workloads.clone();
             // Capture system_prompt for this closure (clone for each iteration)
             let system_prompt = self.config.input.system_prompt.clone();
+            let use_streaming = self.config.endpoint.use_streaming;
 
             handles.push(tokio::spawn(async move {
                 loop {
@@ -818,6 +912,7 @@ impl BenchmarkRunner {
                         workload,
                         idx,
                         false,
+                        use_streaming,
                     )
                     .await;
                 }
@@ -927,6 +1022,7 @@ impl BenchmarkRunner {
                 let semaphore = Arc::clone(&semaphore);
                 let warmup_completed = Arc::clone(&warmup_completed);
                 let system_prompt_clone = system_prompt.clone();
+                let use_streaming = self.config.endpoint.use_streaming;
 
                 let handle = tokio::spawn(async move {
                     let _permit = semaphore
@@ -940,6 +1036,7 @@ impl BenchmarkRunner {
                         workload.clone(),
                         idx,
                         true,
+                        use_streaming,
                     )
                     .await;
                     warmup_completed.fetch_add(1, Ordering::Relaxed);
@@ -961,6 +1058,7 @@ impl BenchmarkRunner {
         } else if let Some(warmup_dur) = warmup_duration {
             let warmup_deadline = Instant::now() + warmup_dur;
             let system_prompt_clone = system_prompt.clone();
+            let use_streaming = self.config.endpoint.use_streaming;
 
             while Instant::now() < warmup_deadline {
                 tokio::time::sleep(distribution.next_delay()).await;
@@ -985,6 +1083,7 @@ impl BenchmarkRunner {
                         workload.clone(),
                         idx,
                         true,
+                        use_streaming,
                     )
                     .await;
                     warmup_completed.fetch_add(1, Ordering::Relaxed);
@@ -1045,6 +1144,7 @@ impl BenchmarkRunner {
             let completed = Arc::clone(&completed);
             let request_timeout = remaining;
             let system_prompt_for_closure = system_prompt.clone();
+            let use_streaming = self.config.endpoint.use_streaming;
 
             let handle = tokio::spawn(async move {
                 let _permit = semaphore
@@ -1060,6 +1160,7 @@ impl BenchmarkRunner {
                         workload.clone(),
                         idx,
                         false,
+                        use_streaming,
                     );
                     match timeout(timeout_duration, request_future).await {
                         Ok(result) => {
@@ -1083,6 +1184,7 @@ impl BenchmarkRunner {
                         workload.clone(),
                         idx,
                         false,
+                        use_streaming,
                     )
                     .await;
                     completed.fetch_add(1, Ordering::Relaxed);
@@ -1156,14 +1258,15 @@ impl BenchmarkRunner {
         workload: Workload,
         index: usize,
         is_warmup: bool,
+        use_streaming: bool,
     ) -> Result<()> {
         match workload {
             Workload::SingleTurn(prompt) => {
-                Self::execute_request(client, tokenizer, prompt, index, is_warmup).await
+                Self::execute_request(client, tokenizer, prompt, index, is_warmup, use_streaming).await
             }
             Workload::MultiTurn(conversation) => {
                 let conversation = conversation.with_system_prompt_override(system_prompt);
-                Self::execute_conversation(client, tokenizer, conversation, index, is_warmup).await
+                Self::execute_conversation(client, tokenizer, conversation, index, is_warmup, use_streaming).await
             }
         }
     }
@@ -1174,13 +1277,24 @@ impl BenchmarkRunner {
         conversation: Conversation,
         index: usize,
         is_warmup: bool,
+        use_streaming: bool,
     ) -> Result<()> {
         debug!(
-            "Executing conversation {} ({} turns, warmup: {})",
+            "Executing conversation {} ({} turns, warmup: {}, streaming: {})",
             index,
             conversation.user_turns.len(),
-            is_warmup
+            is_warmup,
+            use_streaming
         );
+
+        // Track memory at start of conversation (every 100 conversations)
+        let mem_before_conversation = if index % 100 == 0 {
+            let mem = get_rss_mb();
+            info!("RSS memory before conversation {}: {:.1} MB", index, mem);
+            Some(mem)
+        } else {
+            None
+        };
 
         let conversation_start = Instant::now();
 
@@ -1228,8 +1342,10 @@ impl BenchmarkRunner {
                 None,
             );
 
-            match client.chat_completion_stream(request).await {
-                Ok(mut stream) => {
+            if use_streaming {
+                // Streaming mode - full per-turn metrics
+                match client.chat_completion_stream(request).await {
+                    Ok(mut stream) => {
                     // Consume stream, collect response content for conversation history
                     let mut response_content = String::new();
 
@@ -1352,6 +1468,62 @@ impl BenchmarkRunner {
                     break;
                 }
             }
+            } else {
+                // Non-streaming mode - basic per-turn metrics (lower memory usage)
+                match client.chat_completion(request).await {
+                    Ok(response) => {
+                        let total_duration = request_start.elapsed();
+
+                        // Only record metrics if not in warmup phase
+                        if !is_warmup {
+                            let input_tokens = response.usage.prompt_tokens as u64;
+                            let output_tokens = response.usage.completion_tokens as u64;
+
+                            Metrics::record_latency(total_duration);
+                            Metrics::record_tokens(input_tokens, 0, output_tokens);
+                            Metrics::record_request_complete(RequestStatus::Success);
+                        }
+
+                        // Add assistant response to conversation history for next turn
+                        let response_content = response.choices
+                            .first()
+                            .map(|choice| choice.message.content.clone())
+                            .unwrap_or_default();
+
+                        messages.push(Message {
+                            role: "assistant".to_string(),
+                            content: response_content,
+                        });
+                    }
+                    Err(e) => {
+                        debug!("Conversation {} turn {} failed: {}", index, turn_idx, e);
+                        if !is_warmup {
+                            let error_type = if let Some(client_error) = e.downcast_ref::<ClientError>()
+                            {
+                                match client_error {
+                                    ClientError::Connection(_) => ErrorType::Connection,
+                                    ClientError::Http4xx { status, .. } => ErrorType::Http4xx(*status),
+                                    ClientError::Http5xx { status, .. } => ErrorType::Http5xx(*status),
+                                    ClientError::Parse(_) => ErrorType::Parse,
+                                    ClientError::Timeout(_) => ErrorType::Timeout,
+                                    ClientError::StreamError { .. } => ErrorType::Stream,
+                                    ClientError::Other(_) => ErrorType::Other,
+                                }
+                            } else if e.to_string().contains("timeout") {
+                                ErrorType::Timeout
+                            } else if e.to_string().contains("connection") {
+                                ErrorType::Connection
+                            } else {
+                                ErrorType::Other
+                            };
+
+                            Metrics::record_request_complete(RequestStatus::Failed(error_type));
+                        }
+                        conversation_failed = true;
+                        break;
+                    }
+                }
+            }
         }
 
         if !is_warmup {
@@ -1364,6 +1536,15 @@ impl BenchmarkRunner {
             index, is_warmup, conversation_failed
         );
 
+        // Track memory at end of conversation (every 100 conversations)
+        if let Some(mem_before) = mem_before_conversation {
+            let mem_after = get_rss_mb();
+            info!(
+                "RSS memory after conversation {}: {:.1} MB (+{:.1} MB)",
+                index, mem_after, mem_after - mem_before
+            );
+        }
+
         Ok(())
     }
 
@@ -1373,8 +1554,18 @@ impl BenchmarkRunner {
         prompt: Prompt,
         index: usize,
         is_warmup: bool,
+        use_streaming: bool,
     ) -> Result<()> {
-        debug!("Executing request {} (warmup: {})", index, is_warmup);
+        debug!("Executing request {} (warmup: {}, streaming: {})", index, is_warmup, use_streaming);
+
+        // Track memory at start of request (every 100 requests to avoid log spam)
+        let mem_before_request = if index % 100 == 0 {
+            let mem = get_rss_mb();
+            info!("RSS memory before request {}: {:.1} MB", index, mem);
+            Some(mem)
+        } else {
+            None
+        };
 
         let request_start = Instant::now();
 
@@ -1387,7 +1578,9 @@ impl BenchmarkRunner {
         let cache_bust_prompt = format!("[req-{}] {}", index, prompt.prompt);
         let request = client.create_request(&cache_bust_prompt, prompt.max_tokens, None, None);
 
-        match client.chat_completion_stream(request).await {
+        if use_streaming {
+            // Streaming mode - full metrics
+            match client.chat_completion_stream(request).await {
             Ok(mut stream) => {
                 // Consume the stream to measure TTFT and total time
                 let mut total_content = String::new();
@@ -1496,6 +1689,16 @@ impl BenchmarkRunner {
                     "Request {} completed successfully (warmup: {})",
                     index, is_warmup
                 );
+
+                // Track memory at end of request (every 100 requests)
+                if let Some(mem_before) = mem_before_request {
+                    let mem_after = get_rss_mb();
+                    info!(
+                        "RSS memory after request {}: {:.1} MB (+{:.1} MB)",
+                        index, mem_after, mem_after - mem_before
+                    );
+                }
+
                 Ok(())
             }
             Err(e) => {
@@ -1523,6 +1726,66 @@ impl BenchmarkRunner {
                     Metrics::record_request_complete(RequestStatus::Failed(error_type));
                 }
                 Err(e)
+            }
+        }
+        } else {
+            // Non-streaming mode - basic metrics only (lower memory usage)
+            match client.chat_completion(request).await {
+                Ok(response) => {
+                    let total_duration = request_start.elapsed();
+
+                    // Only record metrics if not in warmup phase
+                    if !is_warmup {
+                        let input_tokens = response.usage.prompt_tokens as u64;
+                        let output_tokens = response.usage.completion_tokens as u64;
+
+                        Metrics::record_latency(total_duration);
+                        Metrics::record_tokens(input_tokens, 0, output_tokens);
+                        Metrics::record_request_complete(RequestStatus::Success);
+                    }
+
+                    debug!(
+                        "Request {} completed successfully (warmup: {}, latency_ms: {:.1})",
+                        index, is_warmup, total_duration.as_secs_f64() * 1000.0
+                    );
+
+                    // Track memory at end of request (every 100 requests)
+                    if let Some(mem_before) = mem_before_request {
+                        let mem_after = get_rss_mb();
+                        info!(
+                            "RSS memory after request {}: {:.1} MB (+{:.1} MB)",
+                            index, mem_after, mem_after - mem_before
+                        );
+                    }
+
+                    Ok(())
+                }
+                Err(e) => {
+                    debug!("Request {} failed: {}", index, e);
+                    if !is_warmup {
+                        // Categorize the error
+                        let error_type = if let Some(client_error) = e.downcast_ref::<ClientError>() {
+                            match client_error {
+                                ClientError::Connection(_) => ErrorType::Connection,
+                                ClientError::Http4xx { status, .. } => ErrorType::Http4xx(*status),
+                                ClientError::Http5xx { status, .. } => ErrorType::Http5xx(*status),
+                                ClientError::Parse(_) => ErrorType::Parse,
+                                ClientError::Timeout(_) => ErrorType::Timeout,
+                                ClientError::StreamError { .. } => ErrorType::Stream,
+                                ClientError::Other(_) => ErrorType::Other,
+                            }
+                        } else if e.to_string().contains("timeout") {
+                            ErrorType::Timeout
+                        } else if e.to_string().contains("connection") {
+                            ErrorType::Connection
+                        } else {
+                            ErrorType::Other
+                        };
+
+                        Metrics::record_request_complete(RequestStatus::Failed(error_type));
+                    }
+                    Err(e)
+                }
             }
         }
     }
